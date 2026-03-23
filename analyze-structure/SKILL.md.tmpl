@@ -1,0 +1,228 @@
+---
+name: analyze-structure
+version: 1.0.0
+description: |
+  Target structure characterization for binder design. Given a PDB file or RCSB ID,
+  reports binding site geometry, hotspot candidate residues, secondary structure,
+  surface properties, B-factors, clashes, and design recommendations.
+  Use when asked to "analyze this structure", "characterize this target",
+  "find hotspots", "what are the design constraints for", or before running /design-binder.
+  Proactively suggest before any binder design task when no hotspots have been specified.
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+# /analyze-structure
+
+You are characterizing a protein target to inform binder design. Apply full protein
+design expertise from CLAUDE.md. Output concrete, actionable recommendations —
+not generic descriptions.
+
+---
+
+## Phase 1: Get the Structure
+
+Via AskUserQuestion if not provided:
+- PDB file path, OR
+- RCSB ID (4-character, e.g. "1YCR")
+- Target chain ID (default: A; show available chains if unknown)
+- Optional: region of interest (e.g. "the C-terminal domain" or residues 40-90)
+
+If RCSB ID provided:
+```bash
+PDB_ID="<ID>"
+wget -q "https://files.rcsb.org/download/${PDB_ID}.pdb" -O "${PDB_ID}.pdb" && \
+  echo "Downloaded ${PDB_ID}.pdb" || echo "FETCH_FAILED"
+```
+
+If fetch fails, try mmCIF:
+```bash
+wget -q "https://files.rcsb.org/download/${PDB_ID}.cif" -O "${PDB_ID}.cif" && \
+  echo "Downloaded ${PDB_ID}.cif (mmCIF)" || echo "FETCH_FAILED_BOTH"
+```
+
+---
+
+## Phase 2: Structure Analysis
+
+Run the full analysis. Handle import errors gracefully — report what's available.
+
+```python
+import sys, json
+try:
+    from Bio.PDB import PDBParser, DSSP, NeighborSearch, is_aa
+    from Bio.PDB.SASA import ShrakeRupley
+    import numpy as np
+    BIOPYTHON = True
+except ImportError:
+    BIOPYTHON = False
+    print("WARNING: BioPython not available — install with: pip install biopython")
+
+if BIOPYTHON:
+    TARGET_PDB = "<TARGET_PDB>"
+    CHAIN_ID = "<CHAIN_ID>"
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("target", TARGET_PDB)
+    model = structure[0]
+
+    # --- Basic info ---
+    chains = list(model.get_chains())
+    chain_ids = [c.id for c in chains]
+    chain = model[CHAIN_ID]
+    residues = [r for r in chain.get_residues() if is_aa(r)]
+    print(f"CHAINS: {chain_ids}")
+    print(f"TARGET_CHAIN: {CHAIN_ID}")
+    print(f"N_RESIDUES: {len(residues)}")
+    print(f"RESIDUE_RANGE: {residues[0].get_id()[1]}–{residues[-1].get_id()[1]}")
+
+    # --- B-factors ---
+    bfactors = []
+    flexible_regions = []
+    for res in residues:
+        if "CA" in res:
+            bf = res["CA"].get_bfactor()
+            bfactors.append((res.get_id()[1], bf))
+    avg_bf = np.mean([b for _, b in bfactors])
+    high_bf = [(r, b) for r, b in bfactors if b > 50]
+    print(f"AVG_BFACTOR: {avg_bf:.1f}")
+    if high_bf:
+        print(f"HIGH_BFACTOR_RESIDUES: {[r for r, _ in high_bf[:10]]} ...")
+
+    # --- Atom clashes (simple VdW check) ---
+    all_atoms = list(model.get_atoms())
+    ns = NeighborSearch(all_atoms)
+    clashes = []
+    seen = set()
+    for atom in chain.get_atoms():
+        close = ns.search(atom.get_vector().get_array(), 2.0, "A")
+        for other in close:
+            if other.get_parent() != atom.get_parent():
+                key = tuple(sorted([atom.get_full_id(), other.get_full_id()]))
+                if key not in seen:
+                    seen.add(key)
+                    clashes.append((atom.get_full_id(), other.get_full_id()))
+    print(f"VDW_CLASHES: {len(clashes)}")
+
+    # --- Surface residues (SASA) ---
+    try:
+        sr = ShrakeRupley()
+        sr.compute(structure, level="R")
+        surface_res = []
+        buried_res = []
+        for res in residues:
+            if hasattr(res, 'sasa'):
+                if res.sasa > 40:
+                    surface_res.append(res.get_id()[1])
+                else:
+                    buried_res.append(res.get_id()[1])
+        print(f"SURFACE_RESIDUES_N: {len(surface_res)}")
+        print(f"BURIED_RESIDUES_N: {len(buried_res)}")
+    except Exception as e:
+        print(f"SASA_SKIP: {e}")
+
+    # --- Hotspot candidates: surface residues with low B-factor (stable + accessible) ---
+    stable_surface = []
+    for resnum, bf in bfactors:
+        if bf < 30 and resnum in surface_res:
+            try:
+                res = chain[resnum]
+                resname = res.get_resname()
+                stable_surface.append((resnum, resname, bf))
+            except:
+                pass
+    print(f"HOTSPOT_CANDIDATES (stable+surface): {stable_surface[:20]}")
+
+    print("ANALYSIS_DONE")
+```
+
+---
+
+## Phase 3: Secondary Structure
+
+```bash
+# Run DSSP if available (requires mkdssp installed)
+if command -v mkdssp &>/dev/null; then
+    mkdssp -i <TARGET_PDB> -o /tmp/target.dssp 2>/dev/null && echo "DSSP_DONE" || echo "DSSP_FAILED"
+    # Parse and summarize helix/sheet content
+    python3 -c "
+ss = open('/tmp/target.dssp').read()
+lines = [l for l in ss.split('\n') if len(l) > 16 and l[13] != '!']
+helix = sum(1 for l in lines if l[16] in 'GHI')
+sheet = sum(1 for l in lines if l[16] in 'BE')
+loop  = sum(1 for l in lines if l[16] in ' ST')
+total = helix + sheet + loop
+if total > 0:
+    print(f'HELIX: {helix} ({100*helix//total}%)')
+    print(f'SHEET: {sheet} ({100*sheet//total}%)')
+    print(f'LOOP:  {loop} ({100*loop//total}%)')
+" 2>/dev/null || echo "DSSP_PARSE_FAILED"
+else
+    echo "DSSP_UNAVAILABLE: install with 'conda install -c salilab dssp'"
+fi
+```
+
+---
+
+## Phase 4: Interpret and Report
+
+Based on the analysis, write a structured report to `<TARGET_NAME>_analysis.md`:
+
+```markdown
+# Structure Analysis: <TARGET_NAME> (Chain <CHAIN>)
+
+**Source:** <PDB_ID or file path>
+**Date:** <timestamp>
+**Chain:** <CHAIN> | **Length:** <N> residues (<range>)
+
+## Structure Quality
+- Average B-factor: <value> (<interpretation: <30 rigid, 30-50 moderate, >50 flexible>)
+- VdW clashes: <N> (<0 excellent, 1-5 minor, >5 flag for cleanup>)
+- Secondary structure: <H>% helix / <S>% sheet / <L>% loop
+
+## Surface Properties
+- Surface-exposed residues: <N>
+- Buried core residues: <N>
+- High B-factor surface patches: <list — potential flexible/unreliable regions>
+
+## Hotspot Candidates
+
+Residues that are surface-exposed, structurally stable (B-factor < 30), and
+geometrically accessible for binder contacts:
+
+| Residue | Resname | B-factor | Notes |
+|---------|---------|----------|-------|
+| <num>   | <name>  | <value>  | <e.g., "central to exposed loop"> |
+
+**Recommended hotspot set for binder design:** <A47, A51, A89> — rationale: <...>
+
+## Design Constraints
+
+- **Avoid designing against:** residues <list> (B-factor > 50 — flexible, unreliable)
+- **Preferred binder footprint:** <description of target surface patch geometry>
+- **Estimated target BSA available:** ~<value> Å² for a ~65-residue binder
+- **Secondary structure at target patch:** <helical/loop/mixed — affects backbone strategy>
+
+## Recommendations
+
+1. **Backend:** <RFdiffusion3 / BindCraft> — rationale: <e.g., "target patch is ~800 Å²,
+   suitable for a 60-70 residue de novo binder with RFdiffusion3">
+2. **Binder length:** <N> residues — rationale
+3. **Watch out for:** <specific concern from analysis>
+
+## Next Step
+
+Run `/design-binder` with these hotspots:
+```
+hotspots: <A47,A51,A89>
+chain: <A>
+binder_length: <65>
+```
+```
+
+**STATUS: DONE** — report saved to `<TARGET_NAME>_analysis.md`

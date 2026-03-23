@@ -1,284 +1,465 @@
-# gstack development
+# proteinstack
+
+proteinstack is a Claude Code skill toolkit for computational protein designers.
+It is a fork of gstack, adapted for protein design workflows.
 
 ## Commands
 
 ```bash
 bun install          # install dependencies
-bun test             # run free tests (browse + snapshot + skill validation)
-bun run test:evals   # run paid evals: LLM judge + E2E (diff-based, ~$4/run max)
-bun run test:evals:all  # run ALL paid evals regardless of diff
-bun run test:e2e     # run E2E tests only (diff-based, ~$3.85/run max)
-bun run test:e2e:all # run ALL E2E tests regardless of diff
-bun run eval:select  # show which tests would run based on current diff
-bun run dev <cmd>    # run CLI in dev mode, e.g. bun run dev goto https://example.com
 bun run build        # gen docs + compile binaries
 bun run gen:skill-docs  # regenerate SKILL.md files from templates
 bun run skill:check  # health dashboard for all skills
-bun run dev:skill    # watch mode: auto-regen + validate on change
-bun run eval:list    # list all eval runs from ~/.gstack-dev/evals/
-bun run eval:compare # compare two eval runs (auto-picks most recent)
-bun run eval:summary # aggregate stats across all eval runs
 ```
-
-`test:evals` requires `ANTHROPIC_API_KEY`. Codex E2E tests (`test/codex-e2e.test.ts`)
-use Codex's own auth from `~/.codex/` config — no `OPENAI_API_KEY` env var needed.
-E2E tests stream progress in real-time (tool-by-tool via `--output-format stream-json
---verbose`). Results are persisted to `~/.gstack-dev/evals/` with auto-comparison
-against the previous run.
-
-**Diff-based test selection:** `test:evals` and `test:e2e` auto-select tests based
-on `git diff` against the base branch. Each test declares its file dependencies in
-`test/helpers/touchfiles.ts`. Changes to global touchfiles (session-runner, eval-store,
-llm-judge, gen-skill-docs) trigger all tests. Use `EVALS_ALL=1` or the `:all` script
-variants to force all tests. Run `eval:select` to preview which tests would run.
-
-## Testing
-
-```bash
-bun test             # run before every commit — free, <2s
-bun run test:evals   # run before shipping — paid, diff-based (~$4/run max)
-```
-
-`bun test` runs skill validation, gen-skill-docs quality checks, and browse
-integration tests. `bun run test:evals` runs LLM-judge quality evals and E2E
-tests via `claude -p`. Both must pass before creating a PR.
 
 ## Project structure
 
 ```
-gstack/
-├── browse/          # Headless browser CLI (Playwright)
-│   ├── src/         # CLI + server + commands
-│   │   ├── commands.ts  # Command registry (single source of truth)
-│   │   └── snapshot.ts  # SNAPSHOT_FLAGS metadata array
-│   ├── test/        # Integration tests + fixtures
-│   └── dist/        # Compiled binary
-├── scripts/         # Build + DX tooling
-│   ├── gen-skill-docs.ts  # Template → SKILL.md generator
-│   ├── skill-check.ts     # Health dashboard
-│   └── dev-skill.ts       # Watch mode
-├── test/            # Skill validation + eval tests
-│   ├── helpers/     # skill-parser.ts, session-runner.ts, llm-judge.ts, eval-store.ts
-│   ├── fixtures/    # Ground truth JSON, planted-bug fixtures, eval baselines
-│   ├── skill-validation.test.ts  # Tier 1: static validation (free, <1s)
-│   ├── gen-skill-docs.test.ts    # Tier 1: generator quality (free, <1s)
-│   ├── skill-llm-eval.test.ts   # Tier 3: LLM-as-judge (~$0.15/run)
-│   └── skill-e2e-*.test.ts       # Tier 2: E2E via claude -p (~$3.85/run, split by category)
-├── qa-only/         # /qa-only skill (report-only QA, no fixes)
-├── plan-design-review/  # /plan-design-review skill (report-only design audit)
-├── design-review/    # /design-review skill (design audit + fix loop)
-├── ship/            # Ship workflow skill
-├── review/          # PR review skill
-├── plan-ceo-review/ # /plan-ceo-review skill
-├── plan-eng-review/ # /plan-eng-review skill
-├── autoplan/        # /autoplan skill (auto-review pipeline: CEO → design → eng)
-├── benchmark/       # /benchmark skill (performance regression detection)
-├── canary/          # /canary skill (post-deploy monitoring loop)
-├── codex/           # /codex skill (multi-AI second opinion via OpenAI Codex CLI)
-├── land-and-deploy/ # /land-and-deploy skill (merge → deploy → canary verify)
-├── office-hours/    # /office-hours skill (YC Office Hours — startup diagnostic + builder brainstorm)
-├── investigate/     # /investigate skill (systematic root-cause debugging)
-├── retro/           # Retrospective skill (includes /retro global cross-project mode)
-├── bin/             # Standalone scripts (gstack-global-discover for cross-tool session discovery)
-├── document-release/ # /document-release skill (post-ship doc updates)
-├── cso/             # /cso skill (OWASP Top 10 + STRIDE security audit)
-├── design-consultation/ # /design-consultation skill (design system from scratch)
-├── setup-deploy/    # /setup-deploy skill (one-time deploy config)
-├── bin/             # CLI utilities (gstack-repo-mode, gstack-slug, gstack-config, etc.)
-├── setup            # One-time setup: build binary + symlink skills
-├── SKILL.md         # Generated from SKILL.md.tmpl (don't edit directly)
-├── SKILL.md.tmpl    # Template: edit this, run gen:skill-docs
-├── ETHOS.md         # Builder philosophy (Boil the Lake, Search Before Building)
-└── package.json     # Build scripts for browse
+proteinstack/
+├── design-binder/       # /design-binder skill — full binder design pipeline
+├── analyze-structure/   # /analyze-structure skill — target characterization
+├── validate-design/     # /validate-design skill — fold + score a sequence
+├── setup-protein-env/   # /setup-protein-env skill — one-time tool discovery
+├── backends/            # per-backend knowledge templates
+│   ├── rfdiffusion.md
+│   ├── bindcraft.md
+│   ├── pxdesign.md
+│   └── _base.md
+├── browse/              # headless browser (inherited from gstack)
+├── bin/                 # CLI utilities
+├── setup                # one-time setup script
+└── CLAUDE.md            # this file — the domain brain
 ```
 
-## SKILL.md workflow
+---
 
-SKILL.md files are **generated** from `.tmpl` templates. To update docs:
+# Protein Design Domain Brain
 
-1. Edit the `.tmpl` file (e.g. `SKILL.md.tmpl` or `browse/SKILL.md.tmpl`)
-2. Run `bun run gen:skill-docs` (or `bun run build` which does it automatically)
-3. Commit both the `.tmpl` and generated `.md` files
+This section is the most important part of this file. It makes Claude reason like
+a senior computational protein designer, not a generic AI assistant.
 
-To add a new browse command: add it to `browse/src/commands.ts` and rebuild.
-To add a snapshot flag: add it to `SNAPSHOT_FLAGS` in `browse/src/snapshot.ts` and rebuild.
+**Always apply this knowledge** when working in this repo or when any proteinstack
+skill is active. Do not require the user to re-explain protein design concepts.
 
-**Merge conflicts on SKILL.md files:** NEVER resolve conflicts on generated SKILL.md
-files by accepting either side. Instead: (1) resolve conflicts on the `.tmpl` templates
-and `scripts/gen-skill-docs.ts` (the sources of truth), (2) run `bun run gen:skill-docs`
-to regenerate all SKILL.md files, (3) stage the regenerated files. Accepting one side's
-generated output silently drops the other side's template changes.
+---
 
-## Platform-agnostic design
+## Amino Acid Reference
 
-Skills must NEVER hardcode framework-specific commands, file patterns, or directory
-structures. Instead:
+Single-letter / three-letter codes and key properties:
 
-1. **Read CLAUDE.md** for project-specific config (test commands, eval commands, etc.)
-2. **If missing, AskUserQuestion** — let the user tell you or let gstack search the repo
-3. **Persist the answer to CLAUDE.md** so we never have to ask again
+| 1L | 3L  | Property |
+|----|-----|----------|
+| A  | ALA | Small, hydrophobic, helix-favoring |
+| C  | CYS | Thiol side chain; disulfide bonds; reactive |
+| D  | ASP | Negatively charged (acidic) at pH 7 |
+| E  | GLU | Negatively charged (acidic) at pH 7 |
+| F  | PHE | Aromatic, hydrophobic, bulky |
+| G  | GLY | No side chain; flexible; helix-breaking |
+| H  | HIS | Positively charged at low pH; metal coordination |
+| I  | ILE | Branched hydrophobic; beta-sheet favoring |
+| K  | LYS | Positively charged (basic) |
+| L  | LEU | Hydrophobic; helix-favoring |
+| M  | MET | Hydrophobic; Met-start for expression |
+| N  | ASN | Polar uncharged; N-glycosylation site |
+| P  | PRO | Rigid; helix-breaking; turns |
+| Q  | GLN | Polar uncharged |
+| R  | ARG | Positively charged; H-bond donor (3 NH groups) |
+| S  | SER | Polar; phosphorylation site |
+| T  | THR | Polar; beta-branched |
+| V  | VAL | Branched hydrophobic; beta-sheet favoring |
+| W  | TRP | Largest side chain; aromatic; membrane-anchoring |
+| Y  | TYR | Aromatic; H-bond donor/acceptor; phosphorylation |
 
-This applies to test commands, eval commands, deploy commands, and any other
-project-specific behavior. The project owns its config; gstack reads it.
+---
 
-## Writing SKILL templates
+## File Formats
 
-SKILL.md.tmpl files are **prompt templates read by Claude**, not bash scripts.
-Each bash code block runs in a separate shell — variables do not persist between blocks.
+**PDB (.pdb):**
+- ATOM/HETATM records: columns are atom serial, name, residue name, chain ID,
+  residue seq number, insertion code, X/Y/Z coordinates, occupancy, B-factor
+- Chain IDs matter: A, B, C... Target is usually A, binder is usually B (or A if monomer)
+- Auth numbering vs seq numbering: PDB uses author-assigned numbers that may have gaps
+  or insertions (e.g., "47A"). Structural tools use 0-indexed or 1-indexed seq numbering.
+- HETATM: non-polymer atoms (ligands, waters, ions). Ligands may be relevant for
+  active site design.
+- Multiple MODEL records: NMR ensembles. Use MODEL 1 unless told otherwise.
 
-Rules:
-- **Use natural language for logic and state.** Don't use shell variables to pass
-  state between code blocks. Instead, tell Claude what to remember and reference
-  it in prose (e.g., "the base branch detected in Step 0").
-- **Don't hardcode branch names.** Detect `main`/`master`/etc dynamically via
-  `gh pr view` or `gh repo view`. Use `{{BASE_BRANCH_DETECT}}` for PR-targeting
-  skills. Use "the base branch" in prose, `<base>` in code block placeholders.
-- **Keep bash blocks self-contained.** Each code block should work independently.
-  If a block needs context from a previous step, restate it in the prose above.
-- **Express conditionals as English.** Instead of nested `if/elif/else` in bash,
-  write numbered decision steps: "1. If X, do Y. 2. Otherwise, do Z."
+**mmCIF (.cif):**
+- Modern replacement for PDB format. Handles large structures better.
+- Required for structures > 99,999 atoms.
 
-## Browser interaction
+**FASTA (.fasta / .fa):**
+- `>header\nSEQUENCE` — single-letter amino acid codes, 60-80 chars per line
+- Multiple sequences: separate with `>header` lines
+- For binder design output: one FASTA per candidate or all candidates in one file
 
-When you need to interact with a browser (QA, dogfooding, cookie setup), use the
-`/browse` skill or run the browse binary directly via `$B <command>`. NEVER use
-`mcp__claude-in-chrome__*` tools — they are slow, unreliable, and not what this
-project uses.
+**A3M (.a3m):**
+- Multiple sequence alignment format used by AlphaFold2 for evolutionary context
+- First sequence is the query; subsequent lines are aligned homologs
+- Gaps: `-` (aligned gap), lowercase (inserted residues)
 
-## Vendored symlink awareness
+**NPZ / pickle:**
+- NumPy compressed arrays used by RFdiffusion for internal representations
+- Not human-readable; pass directly to tools
 
-When developing gstack, `.claude/skills/gstack` may be a symlink back to this
-working directory (gitignored). This means skill changes are **live immediately** —
-great for rapid iteration, risky during big refactors where half-written skills
-could break other Claude Code sessions using gstack concurrently.
+---
 
-**Check once per session:** Run `ls -la .claude/skills/gstack` to see if it's a
-symlink or a real copy. If it's a symlink to your working directory, be aware that:
-- Template changes + `bun run gen:skill-docs` immediately affect all gstack invocations
-- Breaking changes to SKILL.md.tmpl files can break concurrent gstack sessions
-- During large refactors, remove the symlink (`rm .claude/skills/gstack`) so the
-  global install at `~/.claude/skills/gstack/` is used instead
+## Score Interpretation
 
-**For plan reviews:** When reviewing plans that modify skill templates or the
-gen-skill-docs pipeline, consider whether the changes should be tested in isolation
-before going live (especially if the user is actively using gstack in other windows).
+### AlphaFold2 / ESMFold / Boltz
 
-## Commit style
+**pLDDT** (per-residue confidence, 0–100):
+- >90: Very high confidence. Trust the structure.
+- 70–90: Confident. Minor uncertainties in loops/termini.
+- 50–70: Low confidence. Likely disordered or flexible.
+- <50: Very low. Residues are probably disordered. Do not interpret structurally.
+- For binders: require >80 average pLDDT, especially at the interface.
 
-**Always bisect commits.** Every commit should be a single logical change. When
-you've made multiple changes (e.g., a rename + a rewrite + new tests), split them
-into separate commits before pushing. Each commit should be independently
-understandable and revertable.
+**ipTM** (interface TM-score, 0–1, multimer only):
+- >0.75: Strong predicted interface. High confidence the complex is real.
+- 0.6–0.75: Reasonable. Worth keeping for experimental testing.
+- <0.6: Weak predicted interface. Usually reject.
+- Standard Baker lab cutoff: ipTM > 0.7 combined with pLDDT > 80.
 
-Examples of good bisection:
-- Rename/move separate from behavior changes
-- Test infrastructure (touchfiles, helpers) separate from test implementations
-- Template changes separate from generated file regeneration
-- Mechanical refactors separate from new features
+**pTM** (whole-complex TM-score, 0–1):
+- Overall fold quality. Less informative than ipTM for binder design.
 
-When the user says "bisect commit" or "bisect and push," split staged/unstaged
-changes into logical commits and push.
+**pAE** (predicted aligned error, matrix, Å):
+- Lower = more confident relative positioning between residues.
+- **Interface pAE**: average pAE between binder and target residues — the key metric.
+  Interface pAE < 10 Å is good; < 5 Å is excellent.
+- High pAE within the binder = uncertain binder structure.
+- High pAE across the interface = uncertain binding mode.
 
-## CHANGELOG + VERSION style
+### ProteinMPNN
 
-**VERSION and CHANGELOG are branch-scoped.** Every feature branch that ships gets its
-own version bump and CHANGELOG entry. The entry describes what THIS branch adds —
-not what was already on main.
+**Sequence score** (negative log-likelihood, more negative = better fit to backbone):
+- Typical range: -1.0 to -2.5 for well-designed sequences.
+- Score < -1.5: sequence fits the backbone well.
+- Score > -0.8: sequence may be poorly matched; consider resampling.
+- Very negative scores (<-3.0): possible overfitting; check sequence complexity.
 
-**When to write the CHANGELOG entry:**
-- At `/ship` time (Step 5), not during development or mid-branch.
-- The entry covers ALL commits on this branch vs the base branch.
-- Never fold new work into an existing CHANGELOG entry from a prior version that
-  already landed on main. If main has v0.10.0.0 and your branch adds features,
-  bump to v0.10.1.0 with a new entry — don't edit the v0.10.0.0 entry.
+**Recovery**: fraction of native-like residues. High recovery on interface = tight packing.
 
-**Key questions before writing:**
-1. What branch am I on? What did THIS branch change?
-2. Is the base branch version already released? (If yes, bump and create new entry.)
-3. Does an existing entry on this branch already cover earlier work? (If yes, replace
-   it with one unified entry for the final version.)
+### RFdiffusion
 
-CHANGELOG.md is **for users**, not contributors. Write it like product release notes:
+**Trajectory loss**: reported during diffusion. Lower final loss = better convergence.
+Not directly comparable across runs with different parameters.
 
-- Lead with what the user can now **do** that they couldn't before. Sell the feature.
-- Use plain language, not implementation details. "You can now..." not "Refactored the..."
-- **Never mention TODOS.md, internal tracking, eval infrastructure, or contributor-facing
-  details.** These are invisible to users and meaningless to them.
-- Put contributor/internal changes in a separate "For contributors" section at the bottom.
-- Every entry should make someone think "oh nice, I want to try that."
-- No jargon: say "every question now tells you which project and branch you're in" not
-  "AskUserQuestion format standardized across skill templates via preamble resolver."
+**Self-consistency pLDDT** (after MPNN + AF2 validation):
+The true quality signal. A backbone that produces high self-consistency pLDDT means
+the designed sequence reliably folds to the intended structure.
 
-## AI effort compression
+### BindCraft
 
-When estimating or discussing effort, always show both human-team and CC+gstack time:
+Uses AF2 multimer internally. Reports:
+- ipTM, pLDDT, pAE — same interpretation as above.
+- **i_pAE**: interface pAE specifically.
+- **binder_score**: composite metric; higher = better binder candidate.
+- **pass/fail**: BindCraft applies its own filters; respect these unless you have reason not to.
 
-| Task type | Human team | CC+gstack | Compression |
-|-----------|-----------|-----------|-------------|
-| Boilerplate / scaffolding | 2 days | 15 min | ~100x |
-| Test writing | 1 day | 15 min | ~50x |
-| Feature implementation | 1 week | 30 min | ~30x |
-| Bug fix + regression test | 4 hours | 15 min | ~20x |
-| Architecture / design | 2 days | 4 hours | ~5x |
-| Research / exploration | 1 day | 3 hours | ~3x |
+---
 
-Completeness is cheap. Don't recommend shortcuts when the complete implementation
-is a "lake" (achievable) not an "ocean" (multi-quarter migration). See the
-Completeness Principle in the skill preamble for the full philosophy.
+## Interface Heuristics
 
-## Search before building
+**Buried surface area (BSA):**
+- < 500 Å²: very weak; probably not a binder.
+- 600–800 Å²: weak but measurable (μM range Kd).
+- 800–1200 Å²: typical small protein binder (nM range).
+- > 1200 Å²: large interface; usually strong binders.
+- Calculate with: `freesasa`, `naccess`, or from AF2 output.
 
-Before designing any solution that involves concurrency, unfamiliar patterns,
-infrastructure, or anything where the runtime/framework might have a built-in:
+**Shape complementarity (Sc):**
+- 0.5–0.6: moderate fit.
+- > 0.65: good shape match (antibody-antigen interfaces are ~0.65).
+- < 0.5: poor fit; binder and target have mismatched surfaces.
 
-1. Search for "{runtime} {thing} built-in"
-2. Search for "{thing} best practice {current year}"
-3. Check official runtime/framework docs
+**H-bonds at interface:**
+- More H-bonds = more specific, more stable.
+- Buried H-bonds (desolvated) are especially stabilizing.
+- Unsatisfied buried polar atoms are energetically costly — flag these.
 
-Three layers of knowledge: tried-and-true (Layer 1), new-and-popular (Layer 2),
-first-principles (Layer 3). Prize Layer 3 above all. See ETHOS.md for the full
-builder philosophy.
+**Van der Waals clashes:**
+- Any clash < 0.4 Å contact distance between non-bonded atoms is a hard reject.
+- Check with: `clashscore` in MolProbity, or `check_structure.py` from BioPython.
 
-## Local plans
+**Electrostatics:**
+- Complementary charges at interface: good.
+- Like charges facing each other: repulsive — bad for binding.
+- Salt bridges (E/D ↔ K/R): stabilizing but pH-sensitive.
 
-Contributors can store long-range vision docs and design documents in `~/.gstack-dev/plans/`.
-These are local-only (not checked in). When reviewing TODOS.md, check `plans/` for candidates
-that may be ready to promote to TODOs or implement.
+---
 
-## E2E eval failure blame protocol
+## Common Failure Modes
 
-When an E2E eval fails during `/ship` or any other workflow, **never claim "not
-related to our changes" without proving it.** These systems have invisible couplings —
-a preamble text change affects agent behavior, a new helper changes timing, a
-regenerated SKILL.md shifts prompt context.
+**Aggregation / poor expression:**
+- Hydrophobic patches on the solvent-exposed surface of the binder.
+  Flag any patch > 6 consecutive hydrophobic residues on the surface.
+- Low-complexity sequences (e.g., AAAAAAA, GGGGG runs) → poor expression.
+- Charged N-terminus (non-Met start) → ribosome issues in bacterial expression.
+- Missing Met at N-terminus for bacterial expression.
+- Too many Cys residues without designed disulfides → random disulfide bonds.
 
-**Required before attributing a failure to "pre-existing":**
-1. Run the same eval on main (or base branch) and show it fails there too
-2. If it passes on main but fails on the branch — it IS your change. Trace the blame.
-3. If you can't run on main, say "unverified — may or may not be related" and flag it
-   as a risk in the PR body
+**Hallucinated structure (common in diffusion models):**
+- High RFdiffusion confidence but low self-consistency pLDDT after MPNN + AF2.
+  This means the diffused backbone cannot actually be folded by a real sequence.
+- Flag when: self-consistency pLDDT < 70, or the AF2 structure differs from the
+  designed backbone by RMSD > 2 Å.
 
-"Pre-existing" without receipts is a lazy claim. Prove it or don't say it.
+**Poor interface:**
+- High binder pLDDT but low ipTM → binder folds well but doesn't bind the target.
+- Large BSA but low shape complementarity → steric fit without true complementarity.
+- MPNN placed mostly Gly/Ala at the interface → no specific contacts.
 
-## Long-running tasks: don't give up
+**Target flexibility:**
+- Designing against a disordered loop or flexible region → low reproducibility.
+  Flag when the target region has B-factors > 50 in the crystal structure, or
+  pLDDT < 70 in the AF2 prediction.
 
-When running evals, E2E tests, or any long-running background task, **poll until
-completion**. Use `sleep 180 && echo "ready"` + `TaskOutput` in a loop every 3
-minutes. Never switch to blocking mode and give up when the poll times out. Never
-say "I'll be notified when it completes" and stop checking — keep the loop going
-until the task finishes or the user tells you to stop.
+**Linker problems (for multi-domain designs):**
+- Too rigid (no Gly/Ser) → strain between domains.
+- Too flexible (all Gly/Ser, >12 residues) → poor AF2 ipTM.
+- Standard linker: (GGGGS)n or (EAAAK)n for rigid connections.
 
-The full E2E suite can take 30-45 minutes. That's 10-15 polling cycles. Do all of
-them. Report progress at each check (which tests passed, which are running, any
-failures so far). The user wants to see the run complete, not a promise that
-you'll check later.
+---
 
-## Deploying to the active skill
+## Backend Reference
 
-The active skill lives at `~/.claude/skills/gstack/`. After making changes:
+### RFdiffusion3 (preferred for most tasks)
 
-1. Push your branch
-2. Fetch and reset in the skill directory: `cd ~/.claude/skills/gstack && git fetch origin && git reset --hard origin/main`
-3. Rebuild: `cd ~/.claude/skills/gstack && bun run build`
+The current state of the art for backbone generation. All-atom, handles DNA/RNA/ligands.
+10x faster than RFdiffusion2.
 
-Or copy the binary directly: `cp browse/dist/browse ~/.claude/skills/gstack/browse/dist/browse`
+**Key parameters:**
+```yaml
+contigmap:
+  contigs: ["A1-150/0 B1-80"]   # target chain A, binder chain B (80 residues)
+  inpaint_seq: ["B1-80"]          # design sequence for chain B
+hotspot_res: ["A47", "A51", "A89"]  # residues binder must contact
+diffuser:
+  T: 50                           # timesteps (50 = default)
+  partial_T: 10                   # partial diffusion (motif scaffolding)
+inference:
+  num_designs: 100               # number of backbone samples
+  noise_scale_ca: 1.0            # noise level (higher = more diversity)
+  noise_scale_frame: 1.0
+```
+
+**Contigmap syntax:**
+- `"A1-150"` = keep residues 1–150 of chain A fixed (target)
+- `"B1-80"` = design 80 residues for chain B (binder)
+- `"0"` = chain break
+- `"/0 "` separates chains in the contig string
+- `"50-100"` = design a chain of length 50–100 (variable length)
+
+**Output:** backbone PDB files (no sequence — just backbone atoms). Feed to ProteinMPNN.
+
+### ProteinMPNN / FAMPNN
+
+Designs sequences for a given backbone.
+
+**Key parameters:**
+```bash
+--pdb_path <backbone.pdb>
+--chain_id_jsonl <chains.json>       # which chains to design
+--fixed_positions_jsonl <fixed.json> # residues to keep fixed (e.g., hotspot contact residues)
+--num_seq_per_target 8               # sequences per backbone (8 is standard; use 16+ for hard targets)
+--sampling_temp 0.1                  # 0.1 = conservative, 0.3 = diverse, 0.5 = highly diverse
+--seed 37
+--out_folder <output_dir>
+```
+
+**When to use FAMPNN:** Same API as MPNN but full-atom aware. Use for ligand-binding
+designs or when side-chain placement matters at design time.
+
+**Output:** FASTA file + scores file (log-likelihood per sequence).
+
+### AlphaFold2 (for validation)
+
+**Multimer mode** for interface validation (required for binder assessment):
+```bash
+--fasta_paths=binder_target.fasta   # both chains in one FASTA, separated by colon or as multimer
+--model_preset=multimer
+--max_template_date=2020-01-01      # prevent template leakage for de novo designs
+```
+
+**Key output files:**
+- `ranked_*.pdb`: structures ranked by confidence
+- `ranking_debug.json`: ipTM, pTM, pLDDT scores for each model
+- `result_model_*.pkl`: full prediction outputs including pAE matrices
+
+**ESMFold** (faster, single-sequence, good for screening):
+```bash
+python esm/scripts/fold.py -i sequences.fasta -o output_dir/ --num-recycles 4
+```
+Use ESMFold for initial screening (speed), AF2 multimer for final validation (accuracy).
+
+### BindCraft
+
+Best for smaller binders (< 100 residues) and when you want an end-to-end pipeline.
+Internally runs AF2 multimer for scoring — no separate validation step needed.
+
+**Config file (YAML):**
+```yaml
+target_pdb: target.pdb
+target_hotspot_res: "A47,A51,A89"
+binder_len: 60                   # residue count
+num_designs: 50
+filters:
+  plddt: 80
+  iptm: 0.6
+  i_pae: 15
+```
+
+**Output:** `final_designs/` folder with ranked PDBs, `results.csv` with all scores.
+
+### PXDesign
+
+Use for: [fill in when configured — run /setup-protein-env to detect installation]
+
+---
+
+## Design Vocabulary
+
+| Term | Meaning |
+|------|---------|
+| **Hotspot residues** | Target residues the binder must physically contact (H-bond, VdW) |
+| **Scaffold** | The structural framework the binder is built on (e.g., a helical bundle) |
+| **Motif grafting** | Transplanting a binding epitope onto a new backbone scaffold |
+| **Partial diffusion** | Starting RFdiffusion from a noisy known structure instead of pure noise |
+| **De novo design** | Designing from scratch with no template structure |
+| **Self-consistency** | MPNN sequence folded back by AF2 gives the original backbone — validates the design |
+| **pAE island** | Low-pAE cluster in the pAE matrix indicating a confident interface |
+| **Buried unsatisfied polar** | Polar atom at the interface with no H-bond partner — energetically costly |
+| **BSA** | Buried surface area — Å² of surface removed from solvent upon complex formation |
+| **Sc** | Shape complementarity (0–1); how well the surfaces fit together |
+| **ipTM** | Interface TM-score — AF2 multimer's confidence in the binding mode |
+| **Nanobody** | Single-domain antibody (~110 AA), good specificity and expression |
+| **Miniprotein binder** | Very small (<60 AA) de novo designed binder |
+| **Cyclic peptide** | Circular backbone peptide; more stable, cell-permeable |
+| **Linker** | Short sequence connecting two protein domains (e.g., GGGGSx3) |
+| **Expression tag** | His-tag, SUMO, etc. added for purification — don't design over them |
+
+---
+
+## Standard Acceptance Thresholds
+
+These are the standard cutoffs used in Baker lab publications and the field.
+Flag candidates that fail any of these. Override only with explicit justification.
+
+| Metric | Reject if | Keep if | Notes |
+|--------|-----------|---------|-------|
+| Binder pLDDT | < 70 | > 80 | Average over binder chain |
+| ipTM | < 0.55 | > 0.70 | AF2 multimer |
+| Interface pAE | > 20 Å | < 10 Å | Average over interface residue pairs |
+| MPNN score | > -0.8 | < -1.5 | Log-likelihood |
+| BSA | < 400 Å² | > 700 Å² | |
+| Self-consistency RMSD | > 2.5 Å | < 1.5 Å | Designed backbone vs AF2 backbone |
+
+---
+
+## Reasoning Like a Senior Protein Designer
+
+When reviewing designs, always ask:
+
+1. **Does the binder actually contact the hotspots?** Check that the hotspot residues
+   are within 4.5 Å of binder atoms in the predicted complex.
+
+2. **Is the interface specific or promiscuous?** Specific = complementary shape +
+   H-bonds + hydrophobic core. Promiscuous = large BSA but mostly hydrophobic burial
+   with no H-bonds.
+
+3. **Will this express?** Check N-terminus (Met?), surface hydrophobics, sequence
+   complexity, disulfide count.
+
+4. **Is the binding mode consistent?** Across multiple AF2 models, does the binder
+   land in the same place? Inconsistent binding modes = uncertain design.
+
+5. **Does the backbone make sense?** Visualize secondary structure. Is there a
+   coherent fold (helices, sheets, loops in sensible arrangement)? Random coil = bad.
+
+6. **What's the failure mode here?** Every design has a most likely failure mode.
+   Name it: "this will likely aggregate due to the exposed hydrophobic patch at
+   residues 23–28" or "the interface is small — might bind but with weak affinity."
+
+When ranking candidates, don't just sort by ipTM. Explain *why* the top candidate
+is better than rank 2. Use the metrics above plus structural reasoning.
+
+---
+
+## Provenance Tracking
+
+Every proteinstack skill writes a `provenance.json` file to the output directory:
+
+```json
+{
+  "timestamp": "<ISO 8601>",
+  "skill": "<skill name>",
+  "backend": "<rfdiffusion3|bindcraft|pxdesign>",
+  "target_pdb": "<path>",
+  "hotspots": ["<chain><resnum>", ...],
+  "parameters": { ... },
+  "n_designs_generated": 100,
+  "n_designs_passed_filters": 12,
+  "candidates": [
+    {
+      "rank": 1,
+      "file": "candidate_001.pdb",
+      "sequence": "MAEFLY...",
+      "plddt": 91.2,
+      "iptm": 0.74,
+      "interface_pae": 7.3,
+      "mpnn_score": -1.83,
+      "bsa": 920,
+      "verdict": "KEEP",
+      "reason": "Strong interface with hotspot contacts at A47, A51. High ipTM + low pAE island."
+    }
+  ],
+  "tool_versions": {
+    "rfdiffusion": "3.0.x",
+    "proteinmpnn": "1.0.x",
+    "alphafold": "2.3.x"
+  },
+  "proteinstack_version": "<version>"
+}
+```
+
+Always write this file. It is the seed for cross-run analysis and institutional memory.
+
+---
+
+## Backend Configuration
+
+On first use, run `/setup-protein-env`. It writes `.proteinstack/config.yaml`:
+
+```yaml
+backends:
+  rfdiffusion3:
+    enabled: true
+    path: /path/to/RFdiffusion
+    weights: /path/to/weights/
+    gpu: true
+  bindcraft:
+    enabled: false
+    path: null
+  pxdesign:
+    enabled: false
+    path: null
+mpnn:
+  path: /path/to/ProteinMPNN
+  version: "1.0.1"
+alphafold:
+  enabled: true
+  path: /path/to/alphafold
+  db_path: /path/to/databases
+esmfold:
+  enabled: true
+  path: /path/to/esm
+gpu:
+  available: true
+  device: "cuda:0"
+```
+
+Skills read this config to determine which backend to use. If a requested backend
+is not configured, the skill will offer alternatives or prompt to run
+`/setup-protein-env` first.

@@ -1,0 +1,382 @@
+---
+name: design-binder
+version: 1.0.0
+description: |
+  Full binder design pipeline. Given a target PDB and hotspot residues, runs
+  backbone generation (RFdiffusion3, BindCraft, or PXDesign), sequence design
+  (ProteinMPNN/FAMPNN), and structure validation (AF2 multimer or ESMFold).
+  Outputs ranked candidates with structural reasoning, REPORT.md, ranked.csv,
+  and provenance.json.
+  Use when asked to "design a binder", "design binders against", "run binder design",
+  "generate binder candidates", or "design miniproteins for".
+  Proactively suggest when the user has a target PDB and wants to find binders.
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+# /design-binder
+
+You are running a full computational binder design pipeline. You have deep protein
+design expertise (see CLAUDE.md domain brain). Do not ask the user to explain metrics
+or concepts — reason about them directly.
+
+**HARD GATE:** This skill runs real computational jobs. Always confirm parameters
+before launching long-running steps (backbone generation can take minutes to hours).
+
+---
+
+## Phase 0: Environment Check
+
+```bash
+CONFIG=".proteinstack/config.yaml"
+[ -f "$CONFIG" ] && echo "CONFIG_FOUND" || echo "CONFIG_MISSING"
+```
+
+If `CONFIG_MISSING`: tell the user "No proteinstack config found. Run `/setup-protein-env`
+first to configure your tools." Then STOP.
+
+If `CONFIG_FOUND`: read it and extract available backends, MPNN path, AF2/ESMFold paths.
+Print: "Active backends: [list enabled backends]"
+
+---
+
+## Phase 1: Input Gathering
+
+Collect required inputs via AskUserQuestion. Ask only for what is missing.
+
+**Required:**
+- Target PDB file path (or RCSB ID — will fetch)
+- Target chain ID (default: A)
+- Hotspot residues (e.g. "A47,A51,A89") — residues the binder must contact
+
+**Optional (use defaults if not provided):**
+- Binder length: default 65 residues (50–80 range; adjust based on target)
+- Number of backbone designs: default 100
+- Backend: auto-detect from config (prefer RFdiffusion3 if available, then BindCraft)
+- Number of MPNN sequences per backbone: default 8
+- Validation method: ESMFold (fast, screening) or AF2 multimer (accurate, final)
+- Output directory: default `./binder_design_<target_name>_<timestamp>/`
+
+**If RCSB ID provided** (4-char, e.g. "1YCR"):
+```bash
+TARGET_ID="<RCSB_ID>"
+wget -q "https://files.rcsb.org/download/${TARGET_ID}.pdb" -O "${TARGET_ID}.pdb"
+echo "Downloaded: ${TARGET_ID}.pdb"
+```
+
+**Summarize inputs before proceeding:**
+```
+TARGET: <path/id>
+CHAIN: <chain>
+HOTSPOTS: <residue list>
+BINDER LENGTH: <n> residues
+N DESIGNS: <n> backbones × <n> MPNN sequences
+BACKEND: <backend>
+VALIDATION: <ESMFold|AF2>
+OUTPUT DIR: <path>
+```
+
+Confirm via AskUserQuestion before launching.
+
+---
+
+## Phase 2: Target Analysis (pre-design check)
+
+Before designing, quickly characterize the target region:
+
+```bash
+python3 - << 'PYEOF'
+import sys
+try:
+    from Bio.PDB import PDBParser, NeighborSearch
+    import numpy as np
+
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("target", "<TARGET_PDB>")
+    model = structure[0]
+    chain = model["<TARGET_CHAIN>"]
+
+    hotspots = [<HOTSPOT_RESNUMS>]  # integer list
+
+    # Get hotspot residues
+    hotspot_res = []
+    for resnum in hotspots:
+        try:
+            res = chain[resnum]
+            hotspot_res.append(res)
+        except KeyError:
+            print(f"WARNING: residue {resnum} not found in chain")
+
+    # Compute center of hotspot patch
+    coords = []
+    for res in hotspot_res:
+        if "CA" in res:
+            coords.append(res["CA"].get_vector().get_array())
+    if coords:
+        center = np.mean(coords, axis=0)
+        print(f"HOTSPOT_CENTER: {center}")
+        spread = np.max(np.linalg.norm(np.array(coords) - center, axis=1))
+        print(f"HOTSPOT_SPREAD: {spread:.1f} Angstrom")
+        if spread > 20:
+            print("WARNING: hotspot residues are spread > 20 Å — consider splitting into sub-patches")
+
+    # Check B-factors at hotspot
+    high_bfactor = [r for r in hotspot_res if any(a.get_bfactor() > 50 for a in r.get_atoms())]
+    if high_bfactor:
+        print(f"WARNING: {len(high_bfactor)} hotspot residues have B-factor > 50 (flexible/uncertain)")
+
+    print("TARGET_ANALYSIS_DONE")
+except ImportError:
+    print("BioPython not available — skipping pre-analysis")
+except Exception as e:
+    print(f"Pre-analysis error (non-blocking): {e}")
+PYEOF
+```
+
+Report findings to user. If warnings exist, surface them but don't block — let user decide.
+
+---
+
+## Phase 3: Backbone Generation
+
+### Option A — RFdiffusion3
+
+```bash
+OUTPUT_DIR="<OUTPUT_DIR>"
+mkdir -p "$OUTPUT_DIR/backbones"
+
+python <RFDIFFUSION_PATH>/run_inference.py \
+  inference.input_pdb=<TARGET_PDB> \
+  inference.output_prefix="$OUTPUT_DIR/backbones/design" \
+  inference.num_designs=<N_DESIGNS> \
+  'contigmap.contigs=["<CHAIN>1-<TARGET_LEN>/0 <BINDER_LEN>-<BINDER_LEN>"]' \
+  'ppi.hotspot_res=["<HOTSPOT_LIST>"]' \
+  denoiser.noise_scale_ca=1 \
+  denoiser.noise_scale_frame=1
+```
+
+Replace `<TARGET_LEN>` with the actual length of the target chain.
+Replace `<HOTSPOT_LIST>` with space-separated hotspot strings like `["A47","A51","A89"]`.
+
+### Option B — BindCraft
+
+```bash
+mkdir -p "<OUTPUT_DIR>"
+cat > "<OUTPUT_DIR>/bindcraft_config.yaml" << YAML
+target_pdb: <TARGET_PDB>
+target_hotspot_res: "<HOTSPOT_CSV>"
+binder_len: <BINDER_LEN>
+num_designs: <N_DESIGNS>
+filters:
+  plddt: 75
+  iptm: 0.55
+  i_pae: 18
+YAML
+
+python <BINDCRAFT_PATH>/run_bindcraft.py \
+  --config "<OUTPUT_DIR>/bindcraft_config.yaml" \
+  --output "<OUTPUT_DIR>/bindcraft_output/"
+```
+
+BindCraft does backbone + MPNN + AF2 validation in one pass — skip Phases 4 and 5 for BindCraft, go directly to Phase 6.
+
+---
+
+## Phase 4: Sequence Design (MPNN)
+
+*Skip if using BindCraft — it handles this internally.*
+
+```bash
+BACKBONES_DIR="<OUTPUT_DIR>/backbones"
+SEQS_DIR="<OUTPUT_DIR>/sequences"
+mkdir -p "$SEQS_DIR"
+
+# Build chain specification JSON
+python3 - << 'PYEOF'
+import json, glob, os
+pdbs = glob.glob(f"{os.environ.get('BACKBONES_DIR', '<OUTPUT_DIR>/backbones')}/*.pdb")
+chains_dict = {os.path.basename(p): ["<BINDER_CHAIN>"] for p in pdbs}
+with open("<OUTPUT_DIR>/chains_to_design.json", "w") as f:
+    json.dump(chains_dict, f)
+print(f"Found {len(pdbs)} backbone PDBs")
+PYEOF
+
+python <MPNN_PATH>/protein_mpnn_run.py \
+  --pdb_path "$BACKBONES_DIR" \
+  --pdb_path_jsonl "" \
+  --chain_id_jsonl "<OUTPUT_DIR>/chains_to_design.json" \
+  --num_seq_per_target <N_MPNN_SEQS> \
+  --sampling_temp 0.1 \
+  --seed 37 \
+  --batch_size 1 \
+  --out_folder "$SEQS_DIR"
+```
+
+After MPNN:
+```bash
+# Count sequences generated
+find "<OUTPUT_DIR>/sequences" -name "*.fa" | xargs grep -c "^>" 2>/dev/null | \
+  awk -F: '{sum += $2} END {print "Total sequences designed:", sum}'
+```
+
+---
+
+## Phase 5: Structure Validation
+
+*Skip if using BindCraft.*
+
+Select validation method based on config and user preference:
+
+### ESMFold (fast screening — use for first pass)
+
+```bash
+SEQS_DIR="<OUTPUT_DIR>/sequences"
+VALIDATION_DIR="<OUTPUT_DIR>/validation_esmfold"
+mkdir -p "$VALIDATION_DIR"
+
+# Concatenate all sequences into one FASTA for batch folding
+cat "$SEQS_DIR"/*.fa > "$VALIDATION_DIR/all_sequences.fasta"
+
+python <ESMFOLD_PATH>/esm/scripts/fold.py \
+  -i "$VALIDATION_DIR/all_sequences.fasta" \
+  -o "$VALIDATION_DIR/" \
+  --num-recycles 4 \
+  --cpu-only  # remove if GPU available
+```
+
+### AF2 Multimer (accurate — use for top candidates)
+
+Use AF2 multimer on the top 20 candidates by ESMFold pLDDT. Always run multimer
+mode for interface validation — monomer mode cannot assess binding.
+
+```bash
+TOP_SEQS_DIR="<OUTPUT_DIR>/top_candidates_seqs"
+mkdir -p "$TOP_SEQS_DIR"
+# (populate with top 20 FASTA files from ESMFold ranking)
+
+python <AF2_PATH>/run_alphafold.py \
+  --fasta_paths="$TOP_SEQS_DIR/<candidate>.fasta" \
+  --model_preset=multimer \
+  --max_template_date=2020-01-01 \
+  --output_dir="<OUTPUT_DIR>/validation_af2/" \
+  --use_gpu_relax=True
+```
+
+---
+
+## Phase 6: Scoring and Ranking
+
+Parse all validation outputs and apply standard acceptance thresholds from CLAUDE.md.
+
+```python
+import json, glob, os
+import numpy as np
+
+results = []
+
+# Parse scores — adapt path patterns to actual output structure
+for score_file in glob.glob("<OUTPUT_DIR>/validation_*/ranking_debug.json"):
+    with open(score_file) as f:
+        data = json.load(f)
+    # AF2 multimer ranking_debug.json structure
+    for model_name, scores in data.get("iptm+ptm", {}).items():
+        iptm = data.get("iptm", {}).get(model_name, 0)
+        ptm  = data.get("ptm", {}).get(model_name, 0)
+        results.append({
+            "candidate": os.path.basename(score_file).replace("ranking_debug.json", ""),
+            "model": model_name,
+            "iptm": iptm,
+            "ptm": ptm,
+            "verdict": "KEEP" if iptm >= 0.70 else ("BORDERLINE" if iptm >= 0.55 else "REJECT"),
+        })
+
+results.sort(key=lambda x: x["iptm"], reverse=True)
+print(json.dumps(results[:20], indent=2))
+```
+
+For each top candidate, apply the reasoning framework from CLAUDE.md:
+1. Does the binder contact the hotspots? (check distances)
+2. Is the interface specific? (H-bonds, shape complementarity)
+3. Expression concerns? (surface hydrophobics, N-terminus, sequence complexity)
+4. Consistent binding mode across models?
+5. What is the most likely failure mode?
+
+**Do not just sort by ipTM.** Explain in protein design terms why rank 1 beats rank 2.
+
+---
+
+## Phase 7: Output
+
+Write three output files to `<OUTPUT_DIR>/`:
+
+### REPORT.md
+
+```markdown
+# Binder Design Report
+
+**Target:** <target_pdb> chain <chain>
+**Hotspots:** <hotspot_list>
+**Backend:** <backend>
+**Date:** <timestamp>
+
+## Summary
+- <N> backbones generated
+- <N> sequences designed (MPNN)
+- <N> passed validation filters
+- Top ipTM: <value> | Top binder pLDDT: <value>
+
+## Top Candidates
+
+### Rank 1 — <candidate_id>
+- pLDDT: <value> | ipTM: <value> | Interface pAE: <value> | MPNN score: <value>
+- **VERDICT: KEEP**
+- **Why:** <structural reasoning — hotspot contacts, interface quality, expression concerns>
+- **Likely failure mode:** <specific concern>
+
+### Rank 2 — <candidate_id>
+...
+
+## Rejected Candidates
+<N> candidates rejected. Top rejection reasons: <summarize>
+
+## Recommendations
+1. <specific next step — e.g., "Run MD simulation on rank 1-3 to assess stability">
+2. <specific next step — e.g., "Consider re-running MPNN with fixed interface residues for rank 4">
+```
+
+### ranked.csv
+
+```
+rank,candidate_id,plddt,iptm,interface_pae,mpnn_score,bsa,verdict,reason
+1,design_042_seq3,91.2,0.74,7.3,-1.83,920,KEEP,"Strong interface..."
+...
+```
+
+### provenance.json
+
+Write full provenance record per the CLAUDE.md specification.
+
+---
+
+## Phase 8: Next Steps
+
+After presenting the report, suggest:
+
+1. **If top candidates look strong (ipTM > 0.75):** "Consider running `/validate-design`
+   on the top 3 to do a deeper structural analysis before ordering synthesis."
+
+2. **If results are mixed (0.55–0.70 ipTM):** "Try re-running with `--sampling_temp 0.3`
+   in MPNN for more sequence diversity, or increase `num_designs` to 200."
+
+3. **If results are poor (ipTM < 0.55):** "The target region may be difficult. Consider:
+   (a) adjusting hotspot selection, (b) trying BindCraft if not already used,
+   (c) running `/analyze-structure` to better characterize the target."
+
+**STATUS: DONE** — report saved to `<OUTPUT_DIR>/REPORT.md`
