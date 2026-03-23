@@ -428,6 +428,24 @@ Always write this file. It is the seed for cross-run analysis and institutional 
 
 ---
 
+## Membrane Topology Tools
+
+**PPM** (Positioning of Proteins in Membranes) — Lomize lab, University of Michigan.
+The software that powers the OPM database. Use this directly rather than querying OPM.
+
+- PPM 3.0: `ppm3 -f input.pdb` — outputs membrane-oriented PDB in working directory
+- PPM 2.0: `ppm -f input.pdb -o output/`
+- Output format: REMARK records with hydrophobic thickness + DUM dummy atoms at
+  Z = ±(thickness/2) marking membrane core boundaries
+- Install: https://opm.phar.umich.edu/ppm_server (standalone download)
+
+Parse membrane boundaries from PPM output:
+- `Hydrophobic thickness` REMARK → total bilayer thickness
+- DUM HETATM atoms → upper (max Z) and lower (min Z) membrane boundaries
+- Extracellular residues: Cα Z > upper_boundary + 3 Å
+- TM core: Cα Z between boundaries
+- Intracellular: Cα Z < lower_boundary - 3 Å
+
 ## Backend Configuration
 
 On first use, run `/setup-protein-env`. It writes `.proteinstack/config.yaml`:

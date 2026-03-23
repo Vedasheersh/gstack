@@ -4,8 +4,9 @@ version: 1.0.0
 description: |
   Full target analysis and epitope identification for binder design.
   Starting from a UniProt ID: fetches protein metadata, finds all PDB structures
-  (target alone and binder complexes), checks if membrane protein and runs OPM
-  to filter to extracellular-only regions, then identifies epitope residues via
+  (target alone and binder complexes), checks if membrane protein and runs PPM
+  (the software behind OPM) to orient the structure and filter to extracellular-only
+  regions, then identifies epitope residues via
   dSASA (if complex structure available) or PeSTo interface propensity
   (target-only path). Outputs a ranked epitope candidate set ready for /design-binder.
   Use at the start of any binder design project. Run before /design-binder.
@@ -229,25 +230,47 @@ Identify the target chain in each structure (match by sequence length / UniProt 
 
 *Skip entirely if not a membrane protein.*
 
-Query OPM for the membrane-oriented structure:
+Run **PPM** (Positioning of Proteins in Membranes) — the Lomize lab software that
+OPM uses on its backend. PPM takes the raw PDB and outputs a membrane-oriented
+structure with the same DUM-atom / REMARK format as OPM files.
 
 ```bash
-TARGET_PDB_ID="<TARGET_PDB_ID_LOWER>"
+# Check PPM is available
+command -v ppm  &>/dev/null && echo "PPM_OK" || \
+command -v ppm3 &>/dev/null && echo "PPM3_OK" || \
+  echo "PPM_NOT_FOUND: install from https://opm.phar.umich.edu/ppm_server"
 
-# Download OPM-oriented structure
-curl -s "https://opm-assets.storage.googleapis.com/pdb/${TARGET_PDB_ID}.pdb" \
-  -o "/tmp/opm_${TARGET_PDB_ID}.pdb" && echo "OPM_DL_OK" || echo "OPM_NOT_IN_DATABASE"
+TARGET_PDB="/tmp/<TARGET_PDB_ID>.pdb"
+WORKDIR="/tmp/ppm_<TARGET_PDB_ID>"
+mkdir -p "$WORKDIR"
+
+# PPM 3.0 (preferred)
+if command -v ppm3 &>/dev/null; then
+  cd "$WORKDIR" && ppm3 -f "$TARGET_PDB" && echo "PPM3_DONE"
+# PPM 2.0 fallback
+elif command -v ppm &>/dev/null; then
+  cd "$WORKDIR" && ppm -f "$TARGET_PDB" -o "$WORKDIR/" && echo "PPM2_DONE"
+else
+  echo "PPM_UNAVAILABLE"
+fi
+
+# PPM writes the oriented PDB alongside the input or into the output dir.
+# Find it:
+PPM_OUT=$(find "$WORKDIR" -name "*.pdb" | grep -v "^$TARGET_PDB$" | head -1)
+echo "PPM_OUTPUT: $PPM_OUT"
 ```
 
-If OPM download fails, try querying their search page and inform the user.
+If PPM is not installed, tell the user and STOP this phase — do not fall back to
+the OPM database. The user should install PPM locally to ensure reproducibility.
 
-Parse OPM structure to extract membrane boundaries and identify extracellular residues:
+Parse PPM output to extract membrane boundaries and identify extracellular residues:
+(PPM output format is identical to OPM PDB files: DUM atoms + REMARK thickness)
 
 ```python
 import re
 import numpy as np
 
-opm_pdb = "/tmp/opm_<TARGET_PDB_ID>.pdb"
+opm_pdb = "$PPM_OUT"  # PPM-oriented PDB (same format as OPM output)
 
 # Parse membrane thickness from REMARK records
 membrane_thickness = None
