@@ -1,0 +1,693 @@
+---
+name: identify-epitopes
+version: 1.0.0
+description: |
+  Full target analysis and epitope identification for binder design.
+  Starting from a UniProt ID: fetches protein metadata, finds all PDB structures
+  (target alone and binder complexes), checks if membrane protein and runs OPM
+  to filter to extracellular-only regions, then identifies epitope residues via
+  dSASA (if complex structure available) or PeSTo interface propensity
+  (target-only path). Outputs a ranked epitope candidate set ready for /design-binder.
+  Use at the start of any binder design project. Run before /design-binder.
+allowed-tools:
+  - Bash
+  - Write
+  - AskUserQuestion
+  - WebSearch
+---
+
+{{PREAMBLE}}
+
+# /identify-epitopes
+
+You are doing rigorous target analysis — the step that determines which surface
+region of the target to design binders against. Apply full protein design expertise
+from CLAUDE.md. Every decision here (which structure to use, which epitope to target)
+directly affects whether the final binders work.
+
+**Output:** A ranked list of epitope residue sets with structural justification,
+written to `<target>_epitopes.md`, ready to pass to `/design-binder`.
+
+---
+
+## Phase 0: Get UniProt ID
+
+If not provided, ask via AskUserQuestion:
+- "What is the UniProt ID of your target protein?"
+- Optional: preferred PDB ID (if you already know which structure to use)
+
+---
+
+## Phase 1: UniProt Lookup
+
+Fetch target metadata from UniProt.
+
+```bash
+UNIPROT_ID="<UNIPROT_ID>"
+curl -s "https://rest.uniprot.org/uniprotkb/${UNIPROT_ID}.json" \
+  -o "/tmp/uniprot_${UNIPROT_ID}.json" && echo "UNIPROT_OK" || echo "UNIPROT_FETCH_FAILED"
+```
+
+Parse the key fields:
+
+```python
+import json, sys
+
+with open(f"/tmp/uniprot_<UNIPROT_ID>.json") as f:
+    data = json.load(f)
+
+# Basic info
+name = data.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", "unknown")
+gene = data.get("genes", [{}])[0].get("geneName", {}).get("value", "unknown")
+organism = data.get("organism", {}).get("scientificName", "unknown")
+length = data.get("sequence", {}).get("length", 0)
+
+print(f"NAME: {name}")
+print(f"GENE: {gene}")
+print(f"ORGANISM: {organism}")
+print(f"LENGTH: {length} AA")
+
+# Membrane protein check — look for subcellular location and topology annotations
+subcell = data.get("comments", [])
+is_membrane = False
+topology_annotations = []
+
+for comment in subcell:
+    if comment.get("commentType") == "SUBCELLULAR LOCATION":
+        for loc in comment.get("subcellularLocations", []):
+            loc_text = loc.get("location", {}).get("value", "")
+            topology = loc.get("topology", {}).get("value", "")
+            topology_annotations.append(loc_text)
+            if any(kw in loc_text.lower() for kw in
+                   ["membrane", "transmembrane", "cell membrane", "plasma membrane"]):
+                is_membrane = True
+
+# Also check features for transmembrane topology
+features = data.get("features", [])
+tm_regions = [(f.get("location", {}).get("start", {}).get("value"),
+               f.get("location", {}).get("end", {}).get("value"))
+              for f in features if f.get("type") == "Transmembrane"]
+topo_regions = [(f.get("type"),
+                 f.get("location", {}).get("start", {}).get("value"),
+                 f.get("location", {}).get("end", {}).get("value"),
+                 f.get("description", ""))
+                for f in features if f.get("type") in
+                ["Topological domain", "Transmembrane", "Signal peptide", "Propeptide"]]
+
+print(f"IS_MEMBRANE_PROTEIN: {is_membrane}")
+print(f"TM_REGIONS: {tm_regions}")
+print(f"TOPOLOGY_FEATURES: {topo_regions}")
+print(f"SUBCELLULAR_LOCATIONS: {topology_annotations}")
+```
+
+**Interpret and report** what you found:
+- Protein name, gene, organism, length
+- Is it a membrane protein? If yes, how many TM helices? What topology (type I, II, multi-pass)?
+- Flag signal peptides or propeptides that would be absent in the mature protein.
+
+---
+
+## Phase 2: Find PDB Structures
+
+Search RCSB for all structures containing this UniProt ID. Separate into:
+- **Target-only structures** (single polymer entity, or multiple but same protein)
+- **Complex structures** (target + a distinct protein binder/antibody/nanobody)
+
+```bash
+UNIPROT_ID="<UNIPROT_ID>"
+curl -s -X POST "https://search.rcsb.org/rcsbsearch/v2/query" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": {
+      "type": "terminal",
+      "service": "text",
+      "parameters": {
+        "attribute": "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+        "operator": "exact_match",
+        "value": "'"${UNIPROT_ID}"'"
+      }
+    },
+    "return_type": "entry",
+    "request_options": {
+      "paginate": {"start": 0, "rows": 100},
+      "sort": [{"sort_by": "rcsb_entry_info.resolution_combined", "direction": "asc"}]
+    }
+  }' -o "/tmp/rcsb_results_${UNIPROT_ID}.json" && \
+  python3 -c "
+import json
+data = json.load(open('/tmp/rcsb_results_<UNIPROT_ID>.json'))
+ids = [r['identifier'] for r in data.get('result_set', [])]
+print(f'FOUND_STRUCTURES: {len(ids)}')
+print(f'PDB_IDS: {ids[:30]}')
+  " || echo "RCSB_SEARCH_FAILED"
+```
+
+For each PDB entry found, fetch summary metadata to classify it:
+
+```python
+import json, urllib.request, time
+
+pdb_ids = <PDB_IDS_LIST>
+target_uniprot = "<UNIPROT_ID>"
+
+structures = {"target_only": [], "complex": [], "other": []}
+
+for pdb_id in pdb_ids[:30]:  # cap at 30 to avoid rate limits
+    try:
+        url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id.lower()}"
+        with urllib.request.urlopen(url, timeout=5) as r:
+            entry = json.loads(r.read())
+
+        resolution = entry.get("rcsb_entry_info", {}).get("resolution_combined", [None])[0]
+        method = entry.get("rcsb_entry_info", {}).get("experimental_method", "")
+        n_entities = entry.get("rcsb_entry_info", {}).get("polymer_entity_count_protein", 0)
+        title = entry.get("struct", {}).get("title", "")
+
+        record = {
+            "pdb_id": pdb_id,
+            "resolution": resolution,
+            "method": method,
+            "n_protein_entities": n_entities,
+            "title": title,
+        }
+
+        # Classify: if multiple protein entities → likely complex
+        if n_entities >= 2:
+            structures["complex"].append(record)
+        else:
+            structures["target_only"].append(record)
+
+        time.sleep(0.05)  # be polite to RCSB
+    except Exception as e:
+        structures["other"].append({"pdb_id": pdb_id, "error": str(e)})
+
+# Sort by resolution (ascending)
+for key in ["target_only", "complex"]:
+    structures[key].sort(key=lambda x: x["resolution"] or 99)
+
+print(json.dumps(structures, indent=2))
+```
+
+**Report to user:**
+```
+Found <N> structures for <TARGET>:
+
+COMPLEX STRUCTURES (target + binder):
+  1. <PDB_ID>  <resolution> Å  — "<title>"
+  2. ...
+
+TARGET-ONLY STRUCTURES:
+  1. <PDB_ID>  <resolution> Å  — "<title>"
+  2. ...
+```
+
+Ask via AskUserQuestion:
+- "Which structure(s) should I use? I recommend [best complex at lowest resolution if available, else best target-only]. Or specify your own."
+- Options: (A) Use recommended, (B) Let me choose, (C) I'll provide my own PDB file
+
+---
+
+## Phase 3: Download Selected Structures
+
+```bash
+# Download best complex structure (if available)
+COMPLEX_PDB="<COMPLEX_PDB_ID>"
+wget -q "https://files.rcsb.org/download/${COMPLEX_PDB}.pdb" \
+  -O "/tmp/${COMPLEX_PDB}.pdb" && echo "COMPLEX_DL_OK" || echo "COMPLEX_DL_FAILED"
+
+# Download best target-only structure
+TARGET_PDB="<TARGET_PDB_ID>"
+wget -q "https://files.rcsb.org/download/${TARGET_PDB}.pdb" \
+  -O "/tmp/${TARGET_PDB}.pdb" && echo "TARGET_DL_OK" || echo "TARGET_DL_FAILED"
+```
+
+Identify the target chain in each structure (match by sequence length / UniProt annotation).
+
+---
+
+## Phase 4: Membrane Protein Handling (if IS_MEMBRANE_PROTEIN)
+
+*Skip entirely if not a membrane protein.*
+
+Query OPM for the membrane-oriented structure:
+
+```bash
+TARGET_PDB_ID="<TARGET_PDB_ID_LOWER>"
+
+# Download OPM-oriented structure
+curl -s "https://opm-assets.storage.googleapis.com/pdb/${TARGET_PDB_ID}.pdb" \
+  -o "/tmp/opm_${TARGET_PDB_ID}.pdb" && echo "OPM_DL_OK" || echo "OPM_NOT_IN_DATABASE"
+```
+
+If OPM download fails, try querying their search page and inform the user.
+
+Parse OPM structure to extract membrane boundaries and identify extracellular residues:
+
+```python
+import re
+import numpy as np
+
+opm_pdb = "/tmp/opm_<TARGET_PDB_ID>.pdb"
+
+# Parse membrane thickness from REMARK records
+membrane_thickness = None
+with open(opm_pdb) as f:
+    for line in f:
+        m = re.search(r"Hydrophobic thickness:\s*([\d.]+)", line)
+        if m:
+            membrane_thickness = float(m.group(1))
+            break
+
+if membrane_thickness is None:
+    # Fall back: DUM atoms mark membrane boundaries
+    # DUM atoms in OPM are at Z = ±(thickness/2)
+    dum_z = []
+    with open(opm_pdb) as f:
+        for line in f:
+            if line.startswith("HETATM") and "DUM" in line:
+                try:
+                    z = float(line[46:54].strip())
+                    dum_z.append(z)
+                except:
+                    pass
+    if dum_z:
+        membrane_thickness = (max(dum_z) - min(dum_z))
+        print(f"MEMBRANE_THICKNESS (from DUM atoms): {membrane_thickness:.1f} Å")
+        mem_upper = max(dum_z)
+        mem_lower = min(dum_z)
+    else:
+        print("WARNING: Could not determine membrane boundaries from OPM file")
+        mem_upper = 15.0
+        mem_lower = -15.0
+else:
+    mem_upper = membrane_thickness / 2
+    mem_lower = -membrane_thickness / 2
+    print(f"MEMBRANE_THICKNESS (from REMARK): {membrane_thickness:.1f} Å")
+    print(f"MEMBRANE_BOUNDARIES: Z = [{mem_lower:.1f}, {mem_upper:.1f}]")
+
+# Identify extracellular residues
+# For a standard type-I single-pass: extracellular = Z > mem_upper
+# For multi-pass: extracellular loops = Z > mem_upper
+# We'll collect all residues with CA Z > mem_upper + 3 Å buffer
+extracellular_residues = []
+intracellular_residues = []
+membrane_residues = []
+
+from Bio.PDB import PDBParser, is_aa
+parser = PDBParser(QUIET=True)
+structure = parser.get_structure("opm", opm_pdb)
+model = structure[0]
+target_chain = model["<TARGET_CHAIN>"]
+
+for res in target_chain.get_residues():
+    if not is_aa(res):
+        continue
+    resnum = res.get_id()[1]
+    if "CA" not in res:
+        continue
+    z = res["CA"].get_vector().get_array()[2]
+
+    if z > mem_upper + 3:
+        extracellular_residues.append(resnum)
+    elif z < mem_lower - 3:
+        intracellular_residues.append(resnum)
+    else:
+        membrane_residues.append(resnum)
+
+print(f"EXTRACELLULAR_RESIDUES ({len(extracellular_residues)}): {extracellular_residues}")
+print(f"TM_CORE_RESIDUES ({len(membrane_residues)}): {membrane_residues}")
+print(f"INTRACELLULAR_RESIDUES ({len(intracellular_residues)}): {intracellular_residues}")
+```
+
+**Report:** Show diagram of topology (extracellular / TM / intracellular residue counts).
+All downstream epitope analysis is restricted to `extracellular_residues` only.
+
+---
+
+## Phase 5: Epitope Identification
+
+Choose path based on whether a complex structure was selected.
+
+---
+
+### PATH A: Complex Structure Available → dSASA Analysis
+
+This is the most reliable path. Residues with high dSASA upon binding are the
+interface hotspots.
+
+#### Step A1: Prepare structures for FreeSASA
+
+```bash
+COMPLEX_PDB="/tmp/<COMPLEX_PDB_ID>.pdb"
+TARGET_CHAIN="<TARGET_CHAIN>"
+BINDER_CHAIN="<BINDER_CHAIN>"  # chain of the known binder in the complex
+WORKDIR="/tmp/epitope_analysis_<TARGET>"
+mkdir -p "$WORKDIR"
+
+# Extract target chain alone from complex (to compute free SASA)
+python3 - << 'PYEOF'
+from Bio.PDB import PDBParser, PDBIO, Select
+
+class ChainSelect(Select):
+    def __init__(self, chain_ids):
+        self.chain_ids = chain_ids
+    def accept_chain(self, chain):
+        return chain.id in self.chain_ids
+
+parser = PDBParser(QUIET=True)
+io = PDBIO()
+
+# Full complex
+struct = parser.get_structure("complex", "<COMPLEX_PDB>")
+io.set_structure(struct)
+io.save("<WORKDIR>/complex.pdb")
+
+# Target chain only (free)
+io.set_structure(struct)
+io.save("<WORKDIR>/target_free.pdb", ChainSelect(["<TARGET_CHAIN>"]))
+
+print("STRUCTURES_PREPARED")
+PYEOF
+```
+
+#### Step A2: Run FreeSASA
+
+```bash
+# Check freesasa is available
+command -v freesasa &>/dev/null && echo "FREESASA_OK" || \
+  echo "FREESASA_NOT_FOUND: install with 'conda install -c bioconda freesasa' or 'pip install freesasa'"
+
+# SASA of target in complex
+freesasa "$WORKDIR/complex.pdb" \
+  --chain-groups="<TARGET_CHAIN>" \
+  --format=rsa \
+  --output="$WORKDIR/complex_sasa.rsa" 2>/dev/null && echo "COMPLEX_SASA_OK"
+
+# SASA of target alone
+freesasa "$WORKDIR/target_free.pdb" \
+  --format=rsa \
+  --output="$WORKDIR/free_sasa.rsa" 2>/dev/null && echo "FREE_SASA_OK"
+```
+
+If FreeSASA is not available, fall back to BioPython SASA (ShrakeRupley):
+
+```python
+from Bio.PDB import PDBParser, is_aa
+from Bio.PDB.SASA import ShrakeRupley
+import numpy as np
+
+parser = PDBParser(QUIET=True)
+sr = ShrakeRupley()
+
+# Complex SASA
+struct_complex = parser.get_structure("complex", "<WORKDIR>/complex.pdb")
+sr.compute(struct_complex, level="R")
+complex_sasa = {}
+for res in struct_complex[0]["<TARGET_CHAIN>"].get_residues():
+    if is_aa(res):
+        complex_sasa[res.get_id()[1]] = getattr(res, "sasa", 0)
+
+# Free SASA
+struct_free = parser.get_structure("free", "<WORKDIR>/target_free.pdb")
+sr.compute(struct_free, level="R")
+free_sasa = {}
+for res in struct_free[0]["<TARGET_CHAIN>"].get_residues():
+    if is_aa(res):
+        free_sasa[res.get_id()[1]] = getattr(res, "sasa", 0)
+
+print("BIOPYTHON_SASA_DONE")
+```
+
+#### Step A3: Compute dSASA and Rank
+
+```python
+import json
+
+# Parse RSA files (or use dicts from BioPython fallback)
+# RSA format: RES CHAIN RESNUM  ABS_free  ABS_bound  REL_free  REL_bound
+# dSASA = free_SASA - complex_SASA (positive = buried upon binding)
+
+dsasa = {}
+for resnum in free_sasa:
+    d = free_sasa.get(resnum, 0) - complex_sasa.get(resnum, 0)
+    dsasa[resnum] = round(d, 2)
+
+# Sort by dSASA descending
+ranked = sorted(dsasa.items(), key=lambda x: x[1], reverse=True)
+
+# Apply membrane filter if applicable
+if "<IS_MEMBRANE_PROTEIN>" == "True":
+    extracellular = set(<EXTRACELLULAR_RESIDUES>)
+    ranked = [(r, d) for r, d in ranked if r in extracellular]
+
+# Interface residues: dSASA > 1 Å² (any contact)
+# Major interface residues: dSASA > 10 Å² (significant burial)
+interface_res = [(r, d) for r, d in ranked if d > 1.0]
+major_res = [(r, d) for r, d in ranked if d > 10.0]
+
+print(f"TOTAL_INTERFACE_RESIDUES: {len(interface_res)}")
+print(f"MAJOR_INTERFACE_RESIDUES (dSASA>10): {len(major_res)}")
+print(f"TOP_20_BY_DSASA:")
+for resnum, d in ranked[:20]:
+    flag = "***" if d > 10 else ("*" if d > 1 else "")
+    print(f"  {resnum:5d}  dSASA={d:6.1f}  {flag}")
+
+# Identify epitope clusters: contiguous or spatially proximal groups
+# (Simple: group by sequential proximity ±5 residues for now)
+major_resnums = sorted([r for r, d in major_res])
+clusters = []
+if major_resnums:
+    cluster = [major_resnums[0]]
+    for i in range(1, len(major_resnums)):
+        if major_resnums[i] - major_resnums[i-1] <= 8:
+            cluster.append(major_resnums[i])
+        else:
+            clusters.append(cluster)
+            cluster = [major_resnums[i]]
+    clusters.append(cluster)
+
+print(f"EPITOPE_CLUSTERS: {clusters}")
+print(json.dumps({
+    "interface_residues": interface_res[:30],
+    "major_residues": major_res,
+    "clusters": clusters,
+}, indent=2))
+```
+
+---
+
+### PATH B: Target-Only Structure → PeSTo / Surface Analysis
+
+Used when no complex structure is available.
+
+#### Step B1: Check if PeSTo is available
+
+```bash
+python3 -c "import pesto; print('PESTO_AVAILABLE')" 2>/dev/null || \
+  python3 -c "
+import subprocess, sys
+result = subprocess.run(['python3', '-m', 'pesto', '--help'],
+  capture_output=True, text=True)
+print('PESTO_OK' if result.returncode == 0 else 'PESTO_NOT_FOUND')
+" 2>/dev/null || echo "PESTO_NOT_FOUND"
+```
+
+#### Step B2a: PeSTo Analysis (if available)
+
+PeSTo predicts interaction propensity for each surface residue using a geometric
+deep learning model trained on protein-protein interfaces.
+
+```bash
+python3 -m pesto predict \
+  --pdb "/tmp/<TARGET_PDB_ID>.pdb" \
+  --chain "<TARGET_CHAIN>" \
+  --output "/tmp/pesto_output/" \
+  2>/dev/null && echo "PESTO_DONE" || echo "PESTO_RUN_FAILED"
+```
+
+Parse PeSTo output (typically a CSV or JSON with per-residue interface scores):
+
+```python
+import pandas as pd  # or json, depending on PeSTo output format
+
+df = pd.read_csv("/tmp/pesto_output/<TARGET>_scores.csv")
+# Columns vary; typically: resnum, chain, resname, interface_score
+ranked = df[df["chain"] == "<TARGET_CHAIN>"].sort_values("interface_score", ascending=False)
+print(ranked.head(30).to_string())
+```
+
+Apply membrane filter if applicable, then cluster top-scoring surface patches.
+
+#### Step B2b: Fallback — Surface Exposure + Conservation + Electrostatics
+
+If PeSTo is not available:
+
+```python
+from Bio.PDB import PDBParser, is_aa
+from Bio.PDB.SASA import ShrakeRupley
+import numpy as np
+
+parser = PDBParser(QUIET=True)
+structure = parser.get_structure("target", "/tmp/<TARGET_PDB_ID>.pdb")
+model = structure[0]
+chain = model["<TARGET_CHAIN>"]
+
+sr = ShrakeRupley()
+sr.compute(structure, level="R")
+
+residues = [r for r in chain.get_residues() if is_aa(r)]
+
+# Score each residue by:
+# 1. Surface accessibility (SASA > 20 Å²) — must be accessible
+# 2. Low B-factor (< 30) — must be ordered/stable
+# 3. Not in TM region (if membrane protein)
+# 4. Favorable residue types for interface (Tyr, Trp, Arg, His, Phe)
+#    — these are enriched in interfaces (Treger & Shakhnovich analysis)
+
+INTERFACE_FAVORABLE = {"TYR", "TRP", "ARG", "HIS", "PHE", "ASN", "ASP", "SER", "THR"}
+
+candidates = []
+for res in residues:
+    resnum = res.get_id()[1]
+    resname = res.get_resname()
+    sasa = getattr(res, "sasa", 0)
+    bfactor = res["CA"].get_bfactor() if "CA" in res else 99
+
+    if sasa < 10:
+        continue  # buried — skip
+    if bfactor > 50:
+        continue  # too flexible — skip
+
+    score = sasa / 100.0  # base: surface area
+    if resname in INTERFACE_FAVORABLE:
+        score *= 1.5
+    if bfactor < 20:
+        score *= 1.2  # bonus for rigidity
+
+    candidates.append((resnum, resname, round(sasa, 1), round(bfactor, 1), round(score, 2)))
+
+candidates.sort(key=lambda x: x[4], reverse=True)
+print(f"TOP_SURFACE_CANDIDATES:")
+for c in candidates[:30]:
+    print(f"  {c[0]:5d} {c[1]:3s}  SASA={c[2]:6.1f}  Bfac={c[3]:5.1f}  score={c[4]:.2f}")
+```
+
+Apply membrane filter if applicable. Group top candidates into spatial clusters
+(residues within 8 Å Cα-Cα distance of each other). Clusters > 3 residues = epitope candidate.
+
+**Tell the user:** "No complex structure found and PeSTo unavailable — using surface
+exposure + residue chemistry scoring. Consider installing PeSTo for better predictions,
+or providing a complex structure if one exists in the literature even if not in PDB."
+
+---
+
+## Phase 6: Cluster Refinement and Output
+
+After either path, refine clusters spatially and select the final epitope sets.
+
+```python
+import numpy as np
+from Bio.PDB import PDBParser, is_aa
+
+# Load structure (use complex or target-only depending on path)
+parser = PDBParser(QUIET=True)
+structure = parser.get_structure("target", "/tmp/<BEST_PDB>.pdb")
+chain = structure[0]["<TARGET_CHAIN>"]
+
+# Build CA coordinate map
+ca_coords = {}
+resnames = {}
+for res in chain.get_residues():
+    if is_aa(res) and "CA" in res:
+        ca_coords[res.get_id()[1]] = res["CA"].get_vector().get_array()
+        resnames[res.get_id()[1]] = res.get_resname()
+
+# For each rough cluster from Phase 5, find all residues within 10 Å
+# of any cluster member (spatial expansion)
+raw_clusters = <CLUSTERS_FROM_PHASE_5>
+final_epitopes = []
+
+for i, cluster_core in enumerate(raw_clusters):
+    cluster_residues = set(cluster_core)
+    # Expand: add any residue within 10 Å of core
+    for resnum, coord in ca_coords.items():
+        for core_res in cluster_core:
+            if core_res in ca_coords:
+                dist = np.linalg.norm(coord - ca_coords[core_res])
+                if dist < 10.0:
+                    cluster_residues.add(resnum)
+
+    # Filter to surface-accessible ones (if SASA data available)
+    cluster_list = sorted(cluster_residues)
+    final_epitopes.append({
+        "epitope_id": f"E{i+1}",
+        "core_residues": cluster_core,
+        "expanded_residues": cluster_list,
+        "n_residues": len(cluster_list),
+        "hotspot_suggestion": cluster_core[:5],  # top contributors as hotspots
+    })
+
+print(f"FINAL_EPITOPES: {len(final_epitopes)}")
+for ep in final_epitopes:
+    print(f"  {ep['epitope_id']}: {ep['n_residues']} residues, "
+          f"core={ep['core_residues']}, hotspots={ep['hotspot_suggestion']}")
+```
+
+---
+
+## Phase 7: Write Output Report
+
+Write `<TARGET_GENE>_epitopes.md` in the current directory.
+
+```markdown
+# Epitope Analysis: <TARGET_NAME> (<UNIPROT_ID>)
+
+**Date:** <timestamp>
+**Structure used:** <PDB_ID> (<resolution> Å, <method>)
+**Analysis path:** <dSASA from complex / PeSTo surface propensity / surface scoring fallback>
+**Membrane protein:** <Yes — OPM-filtered to extracellular regions / No>
+
+## Target Summary
+- **Gene:** <GENE> | **Organism:** <ORGANISM> | **Length:** <N> AA
+- **Topology:** <e.g., Type I single-pass membrane protein — 1 TM helix>
+- **Extracellular region:** residues <range> (if membrane protein)
+
+## Structures Found
+| Type | PDB ID | Resolution | Title |
+|------|--------|-----------|-------|
+| Complex | <id> | <res> Å | <title> |
+| Target only | <id> | <res> Å | <title> |
+
+## Epitope Candidates
+
+### Epitope E1 — <brief description, e.g., "Loop between helix 2 and 3">
+- **Core hotspot residues (by dSASA):** <A47, A51, A55>
+- **Expanded patch:** <A43–A58> (<N> residues)
+- **Evidence:** <e.g., "dSASA contribution 47=18.3, 51=14.2, 55=11.8 Å²">
+- **Structural context:** <e.g., "Exposed beta-hairpin, all residues B-factor < 20, flat accessible surface">
+- **Design suitability:** <HIGH / MEDIUM / LOW> — rationale
+- **Concerns:** <e.g., "Residue 53 has B-factor 45 — may be flexible">
+
+### Epitope E2 — <description>
+...
+
+## Recommended Starting Point
+
+**Use E1 for initial binder design.** Rationale: <structural reasoning>.
+
+Run `/design-binder` with:
+```
+target_pdb: <PDB_ID>.pdb
+target_chain: <CHAIN>
+hotspots: <A47,A51,A55>
+binder_length: 65
+```
+
+## Notes
+- <Any caveats about structure quality, missing loops, crystal contacts, etc.>
+- <If PATH B was used: note that predictions are less reliable than dSASA from complex>
+```
+
+**STATUS: DONE** — epitope report saved to `<TARGET_GENE>_epitopes.md`
+
+Pass `hotspots` from the recommended epitope directly to `/design-binder`.
